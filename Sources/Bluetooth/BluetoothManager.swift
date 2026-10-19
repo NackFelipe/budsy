@@ -83,7 +83,14 @@ final class BluetoothManager: NSObject, @unchecked Sendable {
     /// the panel can show progress instead of the disconnected screen.
     /// Background auto-connect attempts don't count: they'd flash a spinner on
     /// every poll while the buds are away.
-    var isReclaiming: Bool { reclaimRequested && isConnecting }
+    var isReclaiming: Bool { reclaimRequested && (isConnecting || controlReopenPending) }
+    /// Between closing the control channel after the SMEP session and
+    /// opening it again.
+    private var controlReopenPending = false
+    /// The buds ignore an open of the control channel that comes right after
+    /// its close; the attempt then sat out its whole 10s timeout before the
+    /// retry got through. GalaxyBudsClient waits half a second at this point.
+    private let controlReopenDelay: Duration = .seconds(1)
     private var connectedDevice: IOBluetoothDevice?
     private var inquiry: IOBluetoothDeviceInquiry?
     private var centralManager: CBCentralManager?
@@ -526,7 +533,27 @@ final class BluetoothManager: NSObject, @unchecked Sendable {
         isConnected = false
         rfcommChannel?.close()
         rfcommChannel = nil
-        connect(to: DiscoveredDevice(device: device), model: model, silent: true)
+
+        // Hold the auto-connect poll off while waiting, so it doesn't open the
+        // channel too early itself.
+        controlReopenPending = true
+        lastAutoAttempt = Date()
+        let generation = connectGeneration
+        Task { @MainActor [weak self] in
+            try? await Task.sleep(for: self?.controlReopenDelay ?? .seconds(1))
+            guard let self, self.controlReopenPending else { return }
+            self.controlReopenPending = false
+            // Disconnect, sleep or a hand-off in the meantime called it off.
+            guard self.connectGeneration == generation, self.connectedDevice === device,
+                  !self.isConnected, !self.isConnecting,
+                  !self.handedOffToPhone, !self.yieldedToOtherDevice
+            else {
+                self.skipNextMultipoint = false
+                self.reclaimRequested = false
+                return
+            }
+            self.connect(to: DiscoveredDevice(device: device), model: model, silent: true)
+        }
     }
 
     /// Reclaims the buds on the Mac: clears the hand-off (or the switch to

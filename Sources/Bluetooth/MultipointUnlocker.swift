@@ -81,7 +81,8 @@ final class MultipointUnlocker: NSObject {
     private static let retryDelay: Duration = .milliseconds(1500)
     private static let openTimeout: Duration = .seconds(10)
     private static let writeTimeout: Duration = .seconds(3)
-    /// The buds answer a write with a short burst of record frames.
+    /// The longest the buds get to answer a write; they reply with a short
+    /// burst of record frames.
     private static let replyWindow: Duration = .seconds(3)
 
     private var channel: IOBluetoothRFCOMMChannel?
@@ -157,8 +158,14 @@ final class MultipointUnlocker: NSObject {
         }
         DiagnosticsLog.shared.log("multipoint: wrote asVer=2 " + frame.map { String(format: "%02x", $0) }.joined())
 
-        try? await Task.sleep(for: Self.replyWindow)
-        guard run == generation else { return }
+        // The buds usually confirm within a second or two; stop listening as
+        // soon as they report a value that lets the phone stay.
+        let deadline = ContinuousClock.now + Self.replyWindow
+        while ContinuousClock.now < deadline {
+            if let asVer = reportedAsVer, asVer == 2 || asVer == 3 { break }
+            try? await Task.sleep(for: .milliseconds(100))
+            guard run == generation else { return }
+        }
         finish()
     }
 
