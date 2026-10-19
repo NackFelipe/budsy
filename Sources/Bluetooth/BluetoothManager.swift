@@ -87,6 +87,12 @@ final class BluetoothManager: NSObject, @unchecked Sendable {
     /// Between closing the control channel after the SMEP session and
     /// opening it again.
     private var controlReopenPending = false
+    /// When a bud last went into the case or had the lid close on it. With
+    /// one bud worn and the other in the case, closing the lid drops the Mac's
+    /// link for a moment though no other host took the buds, so a close this
+    /// soon after isn't treated as a switch to another device.
+    private var lastCaseChange: Date?
+    private let caseChangeGrace: TimeInterval = 5
     /// The buds ignore an open of the control channel that comes right after
     /// its close; the attempt then sat out its whole 10s timeout before the
     /// retry got through. GalaxyBudsClient waits half a second at this point.
@@ -1282,8 +1288,16 @@ final class BluetoothManager: NSObject, @unchecked Sendable {
     /// periodic status push and the extended status, which carry the same byte
     /// at different offsets.
     private func applyPlacement(_ byte: UInt8) {
+        let previous = (status.placementLeft, status.placementRight)
         status.placementLeft = BudsStatus.Placement(rawValue: Int(byte >> 4)) ?? .unknown
         status.placementRight = BudsStatus.Placement(rawValue: Int(byte & 0x0F)) ?? .unknown
+        if (status.placementLeft, status.placementRight) != previous {
+            DiagnosticsLog.shared.log("placement: left \(status.placementLeft), right \(status.placementRight)")
+            if (status.placementLeft.isInCase && status.placementLeft != previous.0)
+                || (status.placementRight.isInCase && status.placementRight != previous.1) {
+                lastCaseChange = Date()
+            }
+        }
         status.isLeftWearing = status.placementLeft == .wearing
         status.isRightWearing = status.placementRight == .wearing
         status.isLeftCharging = status.placementLeft.isInCase
@@ -1507,7 +1521,11 @@ extension BluetoothManager: IOBluetoothRFCOMMChannelDelegate {
             if let current = self.rfcommChannel, ObjectIdentifier(current) != closed { return }
             // Teardowns the app starts itself clear isConnected first, so a
             // close that finds it still set came from the buds.
-            let switchedAway = self.isConnected && self.multipoint.isVerified && !self.status.isPutAway
+            let caseJustChanged = self.lastCaseChange.map {
+                Date().timeIntervalSince($0) < self.caseChangeGrace
+            } ?? false
+            let switchedAway = self.isConnected && self.multipoint.isVerified
+                && !self.status.isPutAway && !caseJustChanged
             self.multipoint.cancel()
             self.isConnected = false
             self.rfcommChannel = nil
